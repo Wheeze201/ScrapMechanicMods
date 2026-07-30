@@ -106,7 +106,7 @@ Survival mode (no dev mode needed):
 
 | Command | Effect |
 |---|---|
-| `/build <name>` | Builds `<name>` where you are aiming, **consuming the required parts from your inventory** (container contents included). If anything is missing, nothing is built and the missing parts are listed in chat. |
+| `/build <name>` | Builds `<name>` where you are aiming, **consuming the required parts from your inventory** (container contents included). A part you have since upgraded is substituted automatically. If anything is missing, nothing is built and the missing parts are listed in chat. |
 | `/blueprints` | Lists everything `/build` can place. |
 | `/export <name>` | Saves the creation you aim at to `Survival\LocalBlueprints\Exported\<name>.blueprint`. An existing export of that name is backed up as `<name>_backup` first. |
 | `/destroy` | Destroys the creation you aim at and drops all of its parts as loot bags. The creation is autosaved first, so `/build autosave` puts it back. |
@@ -183,6 +183,92 @@ would be unusable). Both commands print a grey line listing what was skipped.
 
 Refined blocks — Scrap Wood **Blocks** and so on — are ordinary items and *are* charged
 and refunded as normal.
+
+### Upgraded parts stand in for the level the blueprint asked for
+
+Engines, seats, saddles, thrusters, controllers, sensors, suspensions, pistons and the
+plasma drill each exist as several *separate shapes*, one per level. Upgrading a part in
+game does not modify it — it **replaces** it, so a Gas Engine Level 1 becomes a Gas Engine
+Level 2 and the level 1 item no longer exists anywhere in the world.
+
+That used to make blueprints rot. A car saved with a level 1 engine still asks for a
+level 1 engine, so `/build` reported *"missing Gas Engine Level 1"* while you were
+carrying the level 2 that fits exactly the same hole.
+
+Now a shortfall of an upgradeable part is covered from a **higher level of the same part**
+in your inventory, and the blueprint is rewritten so the creation is actually built with
+what you paid for. Chat lists the swaps:
+
+    Upgraded parts used in place of the ones the blueprint asked for:
+      1x Gas Engine Level 2 (instead of Gas Engine Level 1)
+      4x Off-Road Suspension Level 3 (instead of Off-Road Suspension Level 1)
+
+Rules:
+
+* **Exact parts are allocated first**, across the whole blueprint, before any substitution.
+  A creation using both a level 1 and a level 2 engine will not spend your only level 2 on
+  the level 1 slot and then declare the level 2 slot missing.
+* The **lowest level above the one asked for** is used, not the highest. Both are "use my
+  upgraded part", and this way a spare level 5 engine is not burned to fill a level 1 slot
+  while a level 2 sits unused. Change `for level = info.level + 1, levels.maxLevel do` in
+  `allocateFromInventory` if you would rather it walk down from the top.
+* It **never downgrades** — a level 1 part will not stand in for the level 3 a creation
+  was designed around.
+* Substitution is per instance, so four level 1 engines can be covered by one level 1, two
+  level 2s and a level 3 all at once.
+* The rewrite is applied *before* your inventory is charged, and the build is cancelled
+  outright if it does not take — so nothing can charge you for an upgrade it then failed
+  to install.
+
+The uuids come from `ITEMS`, the game's own generated name → uuid table
+(`Survival\Scripts\game\survival_items.lua`, already in scope via
+`survival_collections.lua`), so no uuid is hardcoded and levels are probed upwards until
+one is missing — a future level 6 needs no change.
+
+The **family names** are listed explicitly in `UPGRADE_FAMILIES`, because `ITEMS` holds
+every part in the game and a bare `<name>_NN` sweep of it also matches
+`obj_pneumatic_pipe_01`…`_05`, which are five pipe **lengths**, not five levels, plus
+`obj_jewel_01`…`_04` and `outfit_face_01`…`_11`. Substituting one of those for another
+would be a genuine bug. So a game update that adds a whole new upgradeable part needs a
+line adding to that list.
+
+Reading `interactive_upgradeable.shapeset` at runtime would have been self-maintaining and
+was tried first. It does not work: `sm.json.open` returns a table for that path whose
+`partList` yields no entries at all, so the first build of this feature found zero
+families and silently never substituted anything.
+
+The first `/build` in a session records what it found:
+
+    [SurvivalTweaks] upgradeable part levels loaded: 73
+
+and any shortfall of an upgradeable part logs what it went looking for, which is the
+quickest way to tell "there was no higher level to use" apart from "the lookup is broken":
+
+    [SurvivalTweaks] short 1x obj_interactive_gasengine lvl1 - inventory has lvl2=1 lvl3=0 lvl4=0 lvl5=0, still missing 0
+
+### Why imported creations used to spawn frozen
+
+Every body in a blueprint carries a `type`: **0 is dynamic, 1 is static**. Compare the
+game's own files — `Roadside_AbandonedVehicle_*` are all type 0 and drivable,
+`Kit_*_Shell_Shack*` are type 1 and are scenery.
+
+A blueprint saved in-game **from a lift omits the field entirely**, and the engine treats
+a missing type as static. The creation then hangs in the air, ignores being driven, and
+cannot even be rescued with the usual place-a-block-then-remove-it trick — that trick
+works by making the engine re-evaluate a body, and there is nothing to re-evaluate when
+the body simply is not dynamic.
+
+It compounds, too: `/export` records whatever state a creation is *currently* in, so
+exporting an already-frozen creation bakes `type: 1` in permanently.
+
+So `/build` and `/import` now parse the blueprint, force every body of a **player**
+creation (lift blueprint or `/export`) to type 0, and import from the corrected table
+rather than the file. Blueprints read out of the game's own `LocalBlueprints` folder are
+left alone, since some are authored static deliberately. Imported bodies also get
+`setConvertibleToDynamic( true )`, which vanilla sets on bodies it builds from a
+blueprint (`ChallengeData/Scripts/challenge/BuilderWorld.lua`).
+
+An export that was already poisoned repairs itself the next time you `/build` it.
 
 The exclusion list is the game's own `g_resourceCollectorHarvests`
 (`Survival\Scripts\game\survival_collections.lua`), the same list the Resource Collector

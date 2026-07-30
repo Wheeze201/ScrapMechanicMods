@@ -57,12 +57,25 @@ local function resolveBlueprint( name )
 	end
 
 	local exported = EXPORT_DIR .. name .. ".blueprint"
-	if fileExists( exported ) then return exported, name end
+	if fileExists( exported ) then return exported, name, "export" end
 
 	local legacy = "$SURVIVAL_DATA/LocalBlueprints/" .. name .. ".blueprint"
-	if fileExists( legacy ) then return legacy, name end
+	if fileExists( legacy ) then return legacy, name, "asset" end
 
 	return nil
+end
+
+-- [SurvivalTweaks] body "type" 0 is dynamic, 1 is static; a lift-saved blueprint omits
+-- the field and the engine then treats it as static, so the creation imports frozen.
+-- See the longer explanation in SurvivalGame.lua.
+local function forceDynamicBodies( data, source )
+	for _, body in ipairs( data.bodies or {} ) do
+		if source == "asset" then
+			if body.type == nil then body.type = 0 end
+		elseif body.type ~= 0 then
+			body.type = 0
+		end
+	end
 end
 
 CreativeGame = class( nil )
@@ -513,13 +526,25 @@ function CreativeGame.sv_exportCreation( self, params )
 end
 
 function CreativeGame.sv_importCreation( self, params )
-	local path, displayName = resolveBlueprint( params.name )
+	local path, displayName, source = resolveBlueprint( params.name )
 	if not path then
 		return self.network:sendToClients( "client_showMessage", "#ff0000No blueprint or export named '"..tostring( params.name ).."'" )
 	end
-	local status = pcall( sm.creation.importFromFile, params.world, path, params.position )
+	local opened, data = pcall( sm.json.open, path )
+	if not opened or type( data ) ~= "table" or not data.bodies then
+		self.network:sendToClients( "client_showMessage", "#ff0000Blueprint '"..tostring( displayName ).."' could not be read!" )
+		return
+	end
+	forceDynamicBodies( data, source )
+
+	-- import from the parsed table, so the corrected body types reach the engine
+	local status, bodies = pcall( sm.creation.importFromString, params.world, sm.json.writeJsonString( data ), params.position, sm.quat.identity() )
 	if status == false then
 		self.network:sendToClients( "client_showMessage", "#ff0000Could not import '"..tostring( displayName ).."' (it may contain parts this mode does not have)" )
+		return
+	end
+	for _, body in ipairs( bodies or {} ) do
+		pcall( body.setConvertibleToDynamic, body, true )
 	end
 end
 

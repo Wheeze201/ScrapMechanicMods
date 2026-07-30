@@ -116,16 +116,270 @@ local function withoutRawResources( content )
 	return kept, removed
 end
 
--- returns { { uuid = <Uuid>, quantity = <shortfall> }, ... } - empty when everything is covered
-local function missingFromContainer( container, content )
-	local missing = {}
-	for _, shapeData in ipairs( content ) do
-		local available = sm.container.totalQuantity( container, shapeData.uuid )
-		if available < shapeData.quantity then
-			missing[#missing + 1] = { uuid = shapeData.uuid, quantity = shapeData.quantity - available }
+-- [SurvivalTweaks] This is what makes an imported creation hang frozen in the air.
+--
+-- Each body in a blueprint carries a "type": 0 is a dynamic body, 1 is a static one.
+-- Compare the game's own blueprints - Roadside_AbandonedVehicle_* are all type 0 and
+-- drivable, Kit_*_Shell_Shack* are type 1 and are scenery. A blueprint saved in-game
+-- from a lift omits the field completely, and the engine treats a missing type as
+-- static: the creation floats, ignores being driven, and cannot even be woken with the
+-- usual place-a-block-then-remove-it trick, because the body is not dynamic at all.
+--
+-- Worse, /export records whatever state the creation is currently in, so exporting an
+-- already-frozen creation bakes type 1 in permanently.
+--
+-- Player creations - lift blueprints and /export files - are therefore forced to type 0.
+-- Blueprints read out of the game's own LocalBlueprints folder are left untouched, since
+-- some of those are authored static on purpose.
+local function forceDynamicBodies( data, source )
+	local changed = 0
+	for _, body in ipairs( data.bodies or {} ) do
+		if source == "asset" then
+			if body.type == nil then
+				body.type = 0
+				changed = changed + 1
+			end
+		elseif body.type ~= 0 then
+			body.type = 0
+			changed = changed + 1
 		end
 	end
-	return missing
+	return changed
+end
+
+-- vanilla flags bodies it builds from a blueprint as convertible; without it the
+-- place-a-block trick cannot rescue a body either
+-- (ChallengeData/Scripts/challenge/BuilderWorld.lua)
+local function wakeImportedCreation( bodies )
+	for _, body in ipairs( bodies or {} ) do
+		pcall( body.setConvertibleToDynamic, body, true )
+	end
+	return #( bodies or {} )
+end
+
+-- Imports from the parsed table rather than the path, so the body types fixed above
+-- actually reach the engine.
+local function importCreation( world, data, position )
+	local json = sm.json.writeJsonString( data )
+	return sm.creation.importFromString( world, json, position, sm.quat.identity() )
+end
+
+-- [SurvivalTweaks] Upgradeable parts.
+--
+-- Engines, seats, saddles, thrusters, controllers, sensors, suspensions, pistons and the
+-- plasma drill each exist as several separate shapes, one per level. Upgrading a part in
+-- game REPLACES the shape - a Gas Engine Level 1 becomes a Gas Engine Level 2 and the
+-- level 1 item no longer exists anywhere. A blueprint saved before the upgrade still asks
+-- for the level 1 shape, so /build would report "missing Gas Engine Level 1" while the
+-- player is carrying a strictly better part that fits exactly the same hole.
+--
+-- The uuids come from ITEMS, the game's own generated name -> uuid table
+-- (survival_items.lua, pulled in by survival_collections.lua above), so they are never
+-- hardcoded here and cannot drift out of date. Levels are probed upwards until one is
+-- missing, so an update that adds a level 6 is picked up on its own.
+--
+-- The FAMILIES are named explicitly, though, because ITEMS holds every part in the game
+-- and a bare <name>_NN sweep over it also matches obj_pneumatic_pipe_01..05 - which are
+-- five pipe LENGTHS, not five levels - along with obj_jewel_01..04 and outfit_face_01..11.
+-- Silently swapping one of those for another would be a real bug, so the list is the
+-- contents of interactive_upgradeable.shapeset plus the plasma drill. An update that adds
+-- a whole new upgradeable part needs a line adding here.
+--
+-- (Reading that shapeset directly at runtime would be self-maintaining and was tried
+-- first; sm.json.open returns a table for it whose partList yields no entries, so it
+-- found nothing at all.)
+local UPGRADE_FAMILIES = {
+	"jnt_interactive_piston",
+	"jnt_suspensionoffroad",
+	"jnt_suspensionoffroad_bearing",
+	"jnt_suspensionsport",
+	"jnt_suspensionsport_bearing",
+	"obj_interactive_controller",
+	"obj_interactive_driversaddle",
+	"obj_interactive_driverseat",
+	"obj_interactive_electricengine",
+	"obj_interactive_gasengine",
+	"obj_interactive_saddle",
+	"obj_interactive_seat",
+	"obj_interactive_sensor",
+	"obj_interactive_thruster"
+}
+
+-- the plasma drill is the odd one out: _lvl1 .. _lvl3 rather than _01 .. _05
+local UPGRADE_FAMILIES_LVL = { "obj_interactive_plasmadrill" }
+
+local upgradeLevels   -- uuid string -> { family = <string>, level = <number> }
+local upgradeFamilies -- family -> { [level] = uuid string, maxLevel = <number> }
+
+local function loadUpgradeFamilies()
+	if upgradeLevels then return end
+	upgradeLevels, upgradeFamilies = {}, {}
+
+	if type( ITEMS ) ~= "table" then
+		print( "[SurvivalTweaks] ITEMS is not available - /build cannot substitute upgraded parts" )
+		return
+	end
+
+	local counted = 0
+	local function register( family, suffix )
+		local levels = { maxLevel = 0 }
+		local level = 1
+		while true do
+			local item = ITEMS[family..string.format( suffix, level )]
+			if item == nil then break end
+			local uuid = tostring( item ):lower()
+			levels[level] = uuid
+			levels.maxLevel = level
+			upgradeLevels[uuid] = { family = family, level = level }
+			counted = counted + 1
+			level = level + 1
+		end
+		-- a single level is not a family, and nothing can be substituted within it
+		if levels.maxLevel > 1 then upgradeFamilies[family] = levels end
+	end
+
+	for _, family in ipairs( UPGRADE_FAMILIES ) do register( family, "_%02d" ) end
+	for _, family in ipairs( UPGRADE_FAMILIES_LVL ) do register( family, "_lvl%d" ) end
+
+	print( "[SurvivalTweaks] upgradeable part levels loaded: "..counted )
+end
+
+-- [SurvivalTweaks] Works out what to actually take out of the inventory for a build.
+--
+-- Returns spend, substitutions, missing:
+--   spend         - { { uuid = <Uuid>, quantity = n }, ... }, one entry per item
+--   substitutions - { { from = <uuid string>, uuid = <uuid string>, quantity = n }, ... }
+--   missing       - { { uuid = <uuid string>, quantity = n }, ... }, the real shortfall
+--
+-- Exact parts are allocated first, across the whole cost list, before any substitution is
+-- considered. Doing it in one pass would let a blueprint that uses both a level 1 and a
+-- level 2 engine spend the level 2 on the level 1 slot and then declare the level 2 slot
+-- missing.
+--
+-- A shortfall is then covered from the LOWEST level above the one asked for that the
+-- player actually has. Taking the highest instead would burn a level 5 engine on a level 1
+-- slot while a spare level 2 sat in the inventory; either way it is "use my upgraded
+-- part", and this way the better part is not wasted. Downgrading is never done - a level 1
+-- part cannot stand in for the level 3 the blueprint was designed around.
+local function allocateFromInventory( container, content )
+	loadUpgradeFamilies()
+
+	-- units of each item still unspent in the inventory, so two slots cannot both be paid
+	-- for with the same part
+	local remaining = {}
+	local function stock( key, value )
+		if remaining[key] ~= nil then return remaining[key] end
+		local quantity = 0
+		local made = true
+		if value == nil then made, value = pcall( sm.uuid.new, key ) end
+		if made and value then
+			local ok, total = pcall( sm.container.totalQuantity, container, value )
+			if ok and type( total ) == "number" then quantity = total end
+		end
+		remaining[key] = quantity
+		return quantity
+	end
+
+	local spend, shortfall = {}, {}
+	for _, shapeData in ipairs( content ) do
+		local key = tostring( shapeData.uuid ):lower()
+		local take = math.min( shapeData.quantity, stock( key, shapeData.uuid ) )
+		remaining[key] = remaining[key] - take
+		if take > 0 then
+			spend[#spend + 1] = { uuid = shapeData.uuid, quantity = take }
+		end
+		if take < shapeData.quantity then
+			shortfall[#shortfall + 1] = { key = key, quantity = shapeData.quantity - take }
+		end
+	end
+
+	local substitutions, missing = {}, {}
+	for _, entry in ipairs( shortfall ) do
+		local info = upgradeLevels[entry.key]
+		local levels = info and upgradeFamilies[info.family]
+		local needed = entry.quantity
+		if levels then
+			-- logged because a shortfall that should have been covered and was not is
+			-- otherwise indistinguishable from one there was genuinely no part for
+			local trace = {}
+			for level = info.level + 1, levels.maxLevel do
+				local candidate = levels[level]
+				if candidate then
+					local made, value = pcall( sm.uuid.new, candidate )
+					local held = made and stock( candidate, value ) or 0
+					local take = math.min( needed, held )
+					trace[#trace + 1] = "lvl"..level.."="..held
+					if take > 0 then
+						remaining[candidate] = remaining[candidate] - take
+						spend[#spend + 1] = { uuid = value, quantity = take }
+						substitutions[#substitutions + 1] = { from = entry.key, uuid = candidate, quantity = take }
+						needed = needed - take
+					end
+				end
+			end
+			print( "[SurvivalTweaks] short "..entry.quantity.."x "..info.family.." lvl"..info.level..
+				" - inventory has "..( #trace > 0 and table.concat( trace, " " ) or "no higher level" )..
+				", still missing "..needed )
+		end
+		if needed > 0 then
+			missing[#missing + 1] = { uuid = entry.key, quantity = needed }
+		end
+	end
+
+	-- one entry per item before spending: the same shape can be both directly required and
+	-- the target of a substitution, and sm.container.spend should hear about it once
+	local merged, order = {}, {}
+	for _, entry in ipairs( spend ) do
+		local key = tostring( entry.uuid ):lower()
+		if merged[key] then
+			merged[key].quantity = merged[key].quantity + entry.quantity
+		else
+			merged[key] = { uuid = entry.uuid, quantity = entry.quantity }
+			order[#order + 1] = merged[key]
+		end
+	end
+
+	return order, substitutions, missing
+end
+
+-- [SurvivalTweaks] Put the substituted shapes into the blueprint, so the creation that
+-- gets built is the one that was paid for - otherwise /build charges for a level 2 engine
+-- and spawns a level 1. Parts live in bodies[].childs[] and joints (suspensions, pistons)
+-- live in the top level joints[], and both carry a shapeId.
+--
+-- The budget is per substitution, so a blueprint asking for four level 1 engines when the
+-- player has one level 1 and three level 2s rewrites exactly three of them.
+local function applySubstitutions( data, substitutions )
+	if #substitutions == 0 then return 0 end
+
+	local budget = {}
+	for _, sub in ipairs( substitutions ) do
+		budget[sub.from] = budget[sub.from] or {}
+		local options = budget[sub.from]
+		options[#options + 1] = { uuid = sub.uuid, quantity = sub.quantity }
+	end
+
+	local changed = 0
+	local function rewrite( holder )
+		if type( holder ) ~= "table" or type( holder.shapeId ) ~= "string" then return end
+		local options = budget[holder.shapeId:lower()]
+		if not options then return end
+		for _, option in ipairs( options ) do
+			if option.quantity > 0 then
+				holder.shapeId = option.uuid
+				option.quantity = option.quantity - 1
+				changed = changed + 1
+				return
+			end
+		end
+	end
+
+	for _, body in ipairs( data.bodies or {} ) do
+		for _, child in ipairs( body.childs or {} ) do rewrite( child ) end
+	end
+	for _, joint in ipairs( data.joints or {} ) do rewrite( joint ) end
+
+	return changed
 end
 
 -- all-or-nothing: mustSpendAll = true, so a failed transaction takes nothing
@@ -213,10 +467,12 @@ local function resolveBlueprint( name )
 	end
 
 	-- exports made before /export moved into Exported/, and the game's own asset
-	-- blueprints, which are occasionally handy to place
+	-- blueprints, which are occasionally handy to place. "asset" rather than "export":
+	-- some of those are meant to import as static buildings, so their body types are
+	-- left exactly as authored.
 	local legacy = "$SURVIVAL_DATA/LocalBlueprints/" .. name .. ".blueprint"
 	if fileExists( legacy ) then
-		return legacy, name, "export"
+		return legacy, name, "asset"
 	end
 
 	return nil
@@ -1416,24 +1672,26 @@ end
 
 -- [SurvivalTweaks] /build consumes materials from the player inventory, /import (dev cheat) does not
 function SurvivalGame.sv_importCreation( self, params, caller )
-	local path, displayName = resolveBlueprint( params.name )
+	local path, displayName, source = resolveBlueprint( params.name )
 	if not path then
 		return self.network:sendToClients( "client_showMessage", "#ff0000No blueprint or export named '"..tostring( params.name ).."'. #ffffffUse #00ff00/blueprints#ffffff to see what is available." )
 	end
 
+	local opened, data = pcall( sm.json.open, path )
+	if not opened or type( data ) ~= "table" or not data.bodies then
+		return self.network:sendToClients( "client_showMessage", "#ff0000Blueprint '"..tostring( displayName ).."' could not be read!" )
+	end
+
+	forceDynamicBodies( data, source )
+
 	if not params.consume then
-		sm.creation.importFromFile( params.world, path, params.position )
+		wakeImportedCreation( importCreation( params.world, data, params.position ) )
 		return
 	end
 
 	local player = params.player or caller
 	if not player then
 		return self.network:sendToClients( "client_showMessage", "#ff0000/build could not identify the player" )
-	end
-
-	local opened, data = pcall( sm.json.open, path )
-	if not opened or type( data ) ~= "table" or not data.bodies then
-		return self.network:sendToClients( "client_showMessage", "#ff0000Blueprint '"..tostring( displayName ).."' could not be read!" )
 	end
 
 	-- cost is computed from the table we just parsed, not from the path again, so a
@@ -1462,8 +1720,10 @@ function SurvivalGame.sv_importCreation( self, params, caller )
 		return
 	end
 
+	-- a part the player has upgraded since saving the blueprint no longer exists as the
+	-- level the blueprint names, so the upgraded one they do have stands in for it
 	local inventory = player:getInventory()
-	local missing = missingFromContainer( inventory, usable )
+	local spend, substitutions, missing = allocateFromInventory( inventory, usable )
 
 	if #missing > 0 then
 		local report = {}
@@ -1474,12 +1734,30 @@ function SurvivalGame.sv_importCreation( self, params, caller )
 		return
 	end
 
-	if not spendFromContainer( inventory, usable ) then
+	-- Swapped in BEFORE anything is charged. data is the table parsed at the top of this
+	-- call and is thrown away unless the import happens, so an early rewrite costs nothing
+	-- - and if the blueprint could not be rewritten we must not bill for the upgraded
+	-- parts, since the creation would have been built with the ones it already named.
+	local wanted = 0
+	for _, sub in ipairs( substitutions ) do wanted = wanted + sub.quantity end
+	if applySubstitutions( data, substitutions ) < wanted then
+		return self.network:sendToClients( "client_showMessage", "#ff0000Could not fit your upgraded parts into '"..tostring( displayName ).."' - nothing was built or charged." )
+	end
+
+	if not spendFromContainer( inventory, spend ) then
 		return self.network:sendToClients( "client_showMessage", "#ff0000Could not take the materials out of your inventory - nothing was built." )
 	end
 
-	sm.creation.importFromFile( params.world, path, params.position )
+	wakeImportedCreation( importCreation( params.world, data, params.position ) )
 	self.network:sendToClients( "client_showMessage", "Built #00ff00"..tostring( displayName ).."#ffffff from your materials." )
+
+	if #substitutions > 0 then
+		local report = {}
+		for _, sub in ipairs( substitutions ) do
+			report[#report + 1] = { uuid = sub.uuid, quantity = sub.quantity, replaces = sub.from }
+		end
+		self.network:sendToClients( "client_sim_reportParts", { title = "#808080Upgraded parts used in place of the ones the blueprint asked for:", parts = report } )
+	end
 
 	if #skippedResources > 0 then
 		self.network:sendToClients( "client_sim_reportParts", { title = "#808080Not charged for (collector/refinery resources, they respawn with the creation):", parts = skippedResources } )
@@ -1562,10 +1840,20 @@ function SurvivalGame.client_sim_reportParts( self, params )
 		sm.gui.displayAlertText( params.alert )
 	end
 	sm.gui.chatMessage( params.title )
+
+	local function partTitle( uuid )
+		local ok, title = pcall( sm.shape.getShapeTitle, sm.uuid.new( uuid ) )
+		if not ok or title == nil or title == "" then return tostring( uuid ) end
+		return tostring( title )
+	end
+
 	for _, entry in ipairs( params.parts ) do
-		local ok, title = pcall( sm.shape.getShapeTitle, sm.uuid.new( entry.uuid ) )
-		if not ok or title == nil or title == "" then title = entry.uuid end
-		sm.gui.chatMessage( "  #ffff00"..entry.quantity.."x #ffffff"..tostring( title ) )
+		local line = "  #ffff00"..entry.quantity.."x #ffffff"..partTitle( entry.uuid )
+		-- [SurvivalTweaks] set when an upgraded part stood in for the level the blueprint named
+		if entry.replaces then
+			line = line.." #808080(instead of "..partTitle( entry.replaces )..")"
+		end
+		sm.gui.chatMessage( line )
 	end
 end
 
