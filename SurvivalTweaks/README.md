@@ -168,6 +168,28 @@ If both exist with the same name, the in-game blueprint wins. Names ignore case,
 spaces and underscores, so `Car mk1`, `car_mk1` and `CARMK1` are the same thing. A
 blueprint's local id (the guid folder name) works as a name too.
 
+### What `/build` charges for
+
+Everything the game's own `sm.creation.getBlueprintCost` reports — the parts, and the
+contents of any chest or machine inventory on the creation. Those contents come back as
+loot when you `/destroy` it, so it balances.
+
+**Raw resources are the exception and are never charged.** Scrap Wood, Wood, Scrap
+Metal, Metal and Scrap Stone live in Resource Collectors and Refineries and *cannot be
+held in a player inventory at all* — so charging for them made a harvester creation
+impossible to rebuild: it asked for items there is no way to be carrying. They are
+skipped on `/build`, and correspondingly not refunded by `/destroy` (a loot bag of them
+would be unusable). Both commands print a grey line listing what was skipped.
+
+Refined blocks — Scrap Wood **Blocks** and so on — are ordinary items and *are* charged
+and refunded as normal.
+
+The exclusion list is the game's own `g_resourceCollectorHarvests`
+(`Survival\Scripts\game\survival_collections.lua`), the same list the Resource Collector
+and the Refinery use to decide what they accept, so it stays correct if an update adds a
+resource. It currently also names an `obj_harvest_crystal` that does not exist in this
+build; that is harmless, as the nil sits past the last real entry.
+
 ### Run `refresh-blueprints.bat` after saving new blueprints
 
 A creation saved on a lift is stored in your user profile in a folder named after its

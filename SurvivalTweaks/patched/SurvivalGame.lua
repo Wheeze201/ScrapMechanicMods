@@ -34,6 +34,9 @@ dofile( "$SURVIVAL_DATA/Scripts/game/managers/TutorialManager.lua" )
 dofile( "$GAME_DATA/Scripts/game/managers/WeatherManager.lua" )
 dofile( "$SURVIVAL_DATA/Scripts/game/managers/PatrolManager.lua" )
 dofile( "$CUSTOMIZATION_DATA/Scripts/game/quest_reward_util.lua" )
+-- [SurvivalTweaks] for g_resourceCollectorHarvests. UnitManager.lua already pulls this
+-- in transitively, but the blueprint cost depends on it, so load it outright.
+dofile( "$SURVIVAL_DATA/Scripts/game/survival_collections.lua" )
 
 
 
@@ -79,6 +82,38 @@ local function blueprintCost( blueprintOrPath )
 	if not ok then return nil, tostring( content ) end
 	if type( content ) ~= "table" then return nil, "getBlueprintCost returned "..type( content ) end
 	return content, nil
+end
+
+-- [SurvivalTweaks] Raw resources - Scrap Wood logs, Wood, Scrap Metal, Metal, Scrap
+-- Stone, Crystal - live in Resource Collectors and Refineries and cannot be held in a
+-- player inventory at all. getBlueprintCost counts them like any other container
+-- contents, which makes a harvester creation impossible to rebuild: it asks for items
+-- there is no way to be holding. They are dropped from the cost, and correspondingly
+-- from the /destroy refund, since a loot bag full of them would be unusable too.
+--
+-- g_resourceCollectorHarvests is the game's own list (survival_collections.lua) - the
+-- same one the Resource Collector and the Refinery use to decide what they accept - so
+-- this stays correct if an update adds a resource.
+local function rawResourceLookup()
+	local set = {}
+	for _, resourceUuid in ipairs( g_resourceCollectorHarvests or {} ) do
+		set[tostring( resourceUuid )] = true -- keyed by string: Uuid is userdata
+	end
+	return set
+end
+
+-- returns keptContent, removedList
+local function withoutRawResources( content )
+	local resources = rawResourceLookup()
+	local kept, removed = {}, {}
+	for _, shapeData in ipairs( content ) do
+		if resources[tostring( shapeData.uuid )] then
+			removed[#removed + 1] = { uuid = tostring( shapeData.uuid ), quantity = shapeData.quantity }
+		else
+			kept[#kept + 1] = shapeData
+		end
+	end
+	return kept, removed
 end
 
 -- returns { { uuid = <Uuid>, quantity = <shortfall> }, ... } - empty when everything is covered
@@ -1408,6 +1443,10 @@ function SurvivalGame.sv_importCreation( self, params, caller )
 		return self.network:sendToClients( "client_showMessage", "#ff0000Could not read the cost of '"..tostring( displayName ).."': "..tostring( costError ) )
 	end
 
+	-- resources sitting in Resource Collectors / Refineries are not chargeable
+	local skippedResources
+	content, skippedResources = withoutRawResources( content )
+
 	-- a blueprint from an older game version can name parts that no longer exist
 	local unknown = {}
 	local usable = {}
@@ -1441,6 +1480,10 @@ function SurvivalGame.sv_importCreation( self, params, caller )
 
 	sm.creation.importFromFile( params.world, path, params.position )
 	self.network:sendToClients( "client_showMessage", "Built #00ff00"..tostring( displayName ).."#ffffff from your materials." )
+
+	if #skippedResources > 0 then
+		self.network:sendToClients( "client_sim_reportParts", { title = "#808080Not charged for (collector/refinery resources, they respawn with the creation):", parts = skippedResources } )
+	end
 end
 
 -- [SurvivalTweaks] destroy aimed creation and drop all of its parts as loot
@@ -1457,8 +1500,12 @@ function SurvivalGame.sv_destroyCreation( self, params )
 
 	sm.json.save( data, EXPORT_DIR.."autosave.blueprint" )
 
+	-- mirrors /build: raw resources were never charged for, and a loot bag of them would
+	-- be unusable anyway since they cannot enter a player inventory
+	local lootable, lostResources = withoutRawResources( content )
+
 	local loot = {}
-	for _, shapeData in ipairs( content ) do
+	for _, shapeData in ipairs( lootable ) do
 		if sm.shape.uuidExists( shapeData.uuid ) then
 			loot[#loot + 1] = { uuid = shapeData.uuid, quantity = shapeData.quantity }
 		end
@@ -1470,6 +1517,10 @@ function SurvivalGame.sv_destroyCreation( self, params )
 	end
 
 	self.network:sendToClients( "client_showMessage", "Creation destroyed. It was autosaved - rebuild it with #00ff00/build autosave" )
+
+	if #lostResources > 0 then
+		self.network:sendToClients( "client_sim_reportParts", { title = "#808080Lost with the creation (resources cannot be carried, and are not charged on rebuild):", parts = lostResources } )
+	end
 end
 
 function SurvivalGame.client_showAlert( self, msg )
