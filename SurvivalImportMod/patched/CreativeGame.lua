@@ -1,17 +1,69 @@
 -- [SurvivalImportMod] Vanilla 1.0 CreativeGame.lua patched with the Survival Import Mod
--- (adds /export and /import so blueprints can be shared with survival's LocalBlueprints folder)
+-- (adds /export and /import so blueprints can be shared with survival)
 dofile( "$GAME_DATA/Scripts/game/managers/EffectManager.lua" )
 dofile( "$SURVIVAL_DATA/Scripts/game/managers/UnitManager.lua" )
 dofile( "$GAME_DATA/Scripts/game/managers/KinematicManager.lua" )
 dofile( "$GAME_DATA/Scripts/game/managers/TileStorageManager.lua" )
+dofile( "$GAME_DATA/Scripts/game/managers/WeatherManager.lua" )
 dofile( "$SURVIVAL_DATA/Scripts/game/util/recipes.lua" )
 dofile( "$SURVIVAL_DATA/Scripts/game/survival_projectiles.lua" )
 dofile( "$SURVIVAL_DATA/Scripts/game/survival_meleeattacks.lua" )
+dofile( "$SURVIVAL_DATA/Scripts/game/survival_constants.lua" )
 dofile( "$SURVIVAL_DATA/Scripts/game/managers/WorldManager.lua" )
 dofile( "$SURVIVAL_DATA/Scripts/game/scriptableObjects/GlowstickManager.lua" )
 
 
 
+
+-- [SurvivalImportMod] blueprint lookup - same rules as survival's SurvivalGame.lua:
+-- a creation saved on a lift wins, an /export file is the fallback. See the longer
+-- explanation there; in short, $CONTENT_<localId> is the alias the engine gives every
+-- saved blueprint, and _userblueprints.json maps names to those ids because script
+-- cannot list a directory.
+local USER_BLUEPRINT_INDEX = "$SURVIVAL_DATA/LocalBlueprints/_userblueprints.json"
+local EXPORT_DIR = "$SURVIVAL_DATA/LocalBlueprints/Exported/"
+
+local function blueprintKey( name )
+	return ( tostring( name ):lower():gsub( "[^%w]", "" ) )
+end
+
+local function fileExists( path )
+	local ok, exists = pcall( sm.json.fileExists, path )
+	if ok then return exists == true end
+	-- fallback if sm.json.fileExists is not callable from here; see SurvivalGame.lua
+	local opened, data = pcall( sm.json.open, path )
+	return opened and type( data ) == "table"
+end
+
+local function resolveBlueprint( name )
+	if name == nil or name == "" then return nil end
+	name = tostring( name )
+	local wanted = blueprintKey( name )
+	if wanted == "" then return nil end
+
+	local ok, index = pcall( sm.json.open, USER_BLUEPRINT_INDEX )
+	if ok and type( index ) == "table" and type( index.blueprints ) == "table" then
+		for _, entry in ipairs( index.blueprints ) do
+			if type( entry ) == "table" and entry.id and blueprintKey( entry.key or entry.name or "" ) == wanted then
+				local path = "$CONTENT_" .. tostring( entry.id ) .. "/blueprint.json"
+				if fileExists( path ) then return path, tostring( entry.name or name ) end
+			end
+		end
+	end
+
+	if string.find( name, "^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$" ) then
+		local path = "$CONTENT_" .. name .. "/blueprint.json"
+		if fileExists( path ) then return path, name end
+	end
+
+	local exported = EXPORT_DIR .. name .. ".blueprint"
+	if fileExists( exported ) then return exported, name end
+
+	local legacy = "$SURVIVAL_DATA/LocalBlueprints/" .. name .. ".blueprint"
+	if fileExists( legacy ) then return legacy, name end
+
+	return nil
+end
 
 CreativeGame = class( nil )
 CreativeGame.enableLimitedInventory = false
@@ -20,6 +72,15 @@ CreativeGame.enableFuelConsumption = false
 CreativeGame.enableAmmoConsumption = false
 CreativeGame.enableUpgrade = true
 CreativeGame.enableRecipes = false
+
+local TimeSyncInterval = 400
+local WeatherConditions = {
+	rain = "Rain",
+	thunder = "ThunderRain",
+	clear = "Clear",
+	cloudy = "Clouds01",
+	drizzle = "Drizzle",
+}
 
 function CreativeGame.server_onCreate( self )
 	self.sv = {}
@@ -35,7 +96,7 @@ function CreativeGame.server_onCreate( self )
 
 	WorldManager.Sv_OnCreate()
 
-	self.sv.weatherManager = sm.scriptableObject.createScriptableObject( sm.uuid.new( "46e23051-c20b-4929-9df1-7f4f838a3802" ), { permanentForecast = "default" } )
+	self.sv.weatherManager = sm.scriptableObject.createScriptableObject( sm.uuid.new( "46e23051-c20b-4929-9df1-7f4f838a3802" ), { permanentForecast = "CloudyDay", resetForecast = true } )
 
 	self.sv.saved = self.storage:load()
 	if self.sv.saved == nil then
@@ -57,17 +118,18 @@ function CreativeGame.server_onCreate( self )
 		sm.world.loadWorld( self.sv.saved.world )
 	end
 
-	local time = sm.storage.load( STORAGE_CHANNEL_TIME )
-	if time then
+	self.sv.time = sm.storage.load( STORAGE_CHANNEL_TIME )
+	if self.sv.time then
 		print( "Loaded timeData:" )
-		print( time )
+		print( self.sv.time )
 	else
-		time = {}
-		time.timeOfDay = 0.5
-		sm.storage.save( STORAGE_CHANNEL_TIME, time )
+		self.sv.time = { timeOfDay = 0.5, timeProgress = false }
 	end
+	self.sv.time.timeProgress = self.sv.time.timeProgress or false
+	self.sv.timeSyncTick = 0
+	sm.storage.save( STORAGE_CHANNEL_TIME, self.sv.time )
 
-	self.network:setClientData( { time = time.timeOfDay } )
+	self.network:setClientData( { time = self.sv.time } )
 
 	self:loadCraftingRecipes()
 	g_godMode = true
@@ -82,10 +144,24 @@ function CreativeGame.loadCraftingRecipes( self )
 end
 
 function CreativeGame.server_onFixedUpdate( self, timeStep )
+	if self.sv.time.timeProgress then
+		self.sv.time.timeOfDay = self.sv.time.timeOfDay + ( timeStep / DAYCYCLE_TIME )
+	end
+
+	WeatherManager.Sv_SetTimeOfDay( self.sv.time.timeOfDay )
+
+	self.sv.timeSyncTick = self.sv.timeSyncTick + 1
+	if self.sv.timeSyncTick >= TimeSyncInterval then
+		self.sv.timeSyncTick = 0
+		sm.storage.save( STORAGE_CHANNEL_TIME, self.sv.time )
+		self.network:setClientData( { time = self.sv.time } )
+	end
+
 	g_unitManager:sv_onFixedUpdate()
 end
 
 function CreativeGame.server_onPlayerJoined( self, player, newPlayer )
+	WeatherManager.Sv_PlayerJoined( player )
 	if newPlayer then
 		self.sv.saved.world:loadCell( 0, 0, player, "sv_createNewPlayer" )
 	end
@@ -101,9 +177,10 @@ function CreativeGame.client_onCreate( self )
 		self:loadCraftingRecipes()
 	end
 
-	self.cl = {}
+	self.cl = { time = { timeOfDay = 0.5, timeProgress = false } }
 
 	WorldManager.Cl_OnCreate()
+	self.cl.renderManager = sm.clientScriptableObject.createScriptableObject( sm.uuid.new( "54563daa-dd25-4f43-9e49-7e58bd59f66a" ) )
 	
 	g_radioTransmitter = sm.effect.createEffect( "Radio - Transmitter" )
 	g_radioTransmitter:setWorldAny()
@@ -118,10 +195,13 @@ function CreativeGame.client_onCreate( self )
 	sm.game.bindChatCommand( "/dropscrap", {}, "cl_onChatCommand", "Toggles the scrap loot from Haybots" )
 	sm.game.bindChatCommand( "/place", { { "string", "harvestable", false } }, "cl_onChatCommand", "Places a harvestable at the aimed position. Must be placed on the ground. The harvestable parameter controls which harvestable to place: 'stone', 'tree', 'birch', 'leafy', 'spruce', 'pine'" )
 	sm.game.bindChatCommand( "/restrictions", { { "bool", "enable", true } }, "cl_onChatCommand", "Toggles restrictions on creations" )
+	sm.game.bindChatCommand( "/timeofday", { { "number", "timeOfDay", true } }, "cl_onChatCommand", "Sets the time of the day as a fraction (0.5=mid day)" )
+	sm.game.bindChatCommand( "/timeprogress", { { "bool", "enabled", true } }, "cl_onChatCommand", "Enables or disables time progress" )
+	sm.game.bindChatCommand( "/weather", { { "string", "condition", false, { "rain", "thunder", "clear", "cloudy", "drizzle" } } }, "cl_onChatCommand", "Sets the weather condition" )
 	sm.game.bindChatCommand( "/day", {}, "cl_onChatCommand", "Sets time of day to day" )
 	sm.game.bindChatCommand( "/night", {}, "cl_onChatCommand", "Sets time of day to night" )
 
-	-- [SurvivalImportMod] blueprint exchange with survival's LocalBlueprints folder
+	-- [SurvivalImportMod] blueprint exchange with survival
 	-- pcall-protected: a name collision is logged and falls back to /bp* instead of
 	-- aborting all remaining bindings.
 	local function bindModCommand( names, args, help )
@@ -135,8 +215,9 @@ function CreativeGame.client_onCreate( self )
 		end
 		return nil
 	end
-	bindModCommand( { "/export", "/bpexport" }, { { "string", "name", false } }, "Exports aimed creation to $SURVIVAL_DATA/LocalBlueprints/<name>.blueprint" )
-	bindModCommand( { "/import", "/bpimport" }, { { "string", "name", false } }, "Imports blueprint $SURVIVAL_DATA/LocalBlueprints/<name>.blueprint" )
+	-- the extra optional words let a blueprint saved as "Car mk1" be typed as-is
+	bindModCommand( { "/export", "/bpexport" }, { { "string", "name", false } }, "Exports aimed creation to $SURVIVAL_DATA/LocalBlueprints/Exported/<name>.blueprint" )
+	bindModCommand( { "/import", "/bpimport" }, { { "string", "name", false }, { "string", "...", true }, { "string", "...", true }, { "string", "...", true } }, "Places <name> - one of your saved blueprints, or an /export" )
 
 
 
@@ -189,10 +270,35 @@ function CreativeGame.cl_compassHudEnable( self, enable )
 end
 
 function CreativeGame.client_onClientDataUpdate( self, clientData )
-	sm.game.setTimeOfDay( clientData.time )
-	sm.render.setOutdoorLighting( clientData.time )
+	self.cl.time = clientData.time
+	self:cl_updateTimeOfDay()
+end
+
+function CreativeGame.client_onUpdate( self, dt )
+	if self.cl.time.timeProgress then
+		self.cl.time.timeOfDay = self.cl.time.timeOfDay + ( dt / DAYCYCLE_TIME )
+	end
+	self:cl_updateTimeOfDay()
+end
+
+function CreativeGame.cl_updateTimeOfDay( self )
+	local timeOfDay = math.fmod( self.cl.time.timeOfDay, 1 )
+	sm.game.setTimeOfDay( timeOfDay )
+
+	local index = 1
+	while index < #DAYCYCLE_LIGHTING_TIMES and timeOfDay >= DAYCYCLE_LIGHTING_TIMES[index + 1] do
+		index = index + 1
+	end
+
+	local light = DAYCYCLE_LIGHTING_VALUES[index]
+	if index < #DAYCYCLE_LIGHTING_TIMES then
+		local fraction = ( timeOfDay - DAYCYCLE_LIGHTING_TIMES[index] ) / ( DAYCYCLE_LIGHTING_TIMES[index + 1] - DAYCYCLE_LIGHTING_TIMES[index] )
+		light = sm.util.lerp( DAYCYCLE_LIGHTING_VALUES[index], DAYCYCLE_LIGHTING_VALUES[index + 1], fraction )
+	end
+	sm.render.setOutdoorLighting( light )
+
 	if WeatherManager.Get() then
-		WeatherManager.Get():cl_setTimeOfDay( clientData.time )
+		WeatherManager.Get():cl_setTimeOfDay( self.cl.time.timeOfDay )
 	end
 end
 
@@ -265,11 +371,19 @@ function CreativeGame.cl_onChatCommand( self, params )
 			sm.gui.chatMessage( "#ff0000Aim at a creation to export it" )
 		end
 	elseif params[1] == "/import" or params[1] == "/bpimport" then
+		-- the name arrives split across arguments when it contains spaces
+		local nameParts = {}
+		for i = 2, #params do
+			if type( params[i] ) == "string" and params[i] ~= "" then
+				nameParts[#nameParts + 1] = params[i]
+			end
+		end
+
 		local rayCastValid, rayCastResult = sm.localPlayer.getRaycast( 100 )
 		if rayCastValid then
 			self.network:sendToServer( "sv_importCreation", {
 				world = sm.localPlayer.getPlayer().character:getWorld(),
-				name = params[2],
+				name = table.concat( nameParts, " " ),
 				position = rayCastResult.pointWorld
 			} )
 		else
@@ -344,14 +458,20 @@ function CreativeGame.sv_n_onChatCommand( self, params, player )
 		end
 		sm.game.setEnableRestrictions( restrictions )
 		self.network:sendToClients( "client_showMessage", "RESTRICTIONS: " .. ( restrictions and "On" or "Off" ) )
+	elseif params[1] == "/timeofday" then
+		self:sv_setTimeOfDay( params[2] )
+	elseif params[1] == "/timeprogress" then
+		self:sv_setTimeProgress( params[2] )
+	elseif params[1] == "/weather" then
+		local condition = WeatherConditions[string.lower( params[2] )]
+		if condition then
+			WeatherManager.Sv_StartCondition( condition )
+			self.network:sendToClients( "client_showMessage", "Weather: " .. params[2] )
+		end
 	elseif params[1] == "/day" then
-		local time = { timeOfDay = 0.5 }
-		sm.storage.save( STORAGE_CHANNEL_TIME, time )
-		self.network:setClientData( { time = 0.5 } )
+		self:sv_setTimeOfDay( 0.5 )
 	elseif params[1] == "/night" then
-		local time = { timeOfDay = 0.0 }
-		sm.storage.save( STORAGE_CHANNEL_TIME, time )
-		self.network:setClientData( { time = 0.0 } )
+		self:sv_setTimeOfDay( 0.0 )
 	else
 		if sm.exists( player.character ) then
 			params.player = player
@@ -360,22 +480,46 @@ function CreativeGame.sv_n_onChatCommand( self, params, player )
 	end
 end
 
+function CreativeGame.sv_setTimeOfDay( self, timeOfDay )
+	if timeOfDay ~= nil then
+		self.sv.time.timeOfDay = math.floor( self.sv.time.timeOfDay ) + sm.util.clamp( timeOfDay, 0.0, 0.9999 )
+		sm.storage.save( STORAGE_CHANNEL_TIME, self.sv.time )
+		self.network:setClientData( { time = self.sv.time } )
+	end
+	self.network:sendToClients( "client_showMessage", "Time of day set to " .. self.sv.time.timeOfDay )
+end
+
+function CreativeGame.sv_setTimeProgress( self, timeProgress )
+	if timeProgress ~= nil then
+		self.sv.time.timeProgress = timeProgress
+		sm.storage.save( STORAGE_CHANNEL_TIME, self.sv.time )
+		self.network:setClientData( { time = self.sv.time } )
+	end
+	self.network:sendToClients( "client_showMessage", "Time progress: " .. ( self.sv.time.timeProgress and "On" or "Off" ) )
+end
+
 -- [SurvivalImportMod] blueprint export/import server side
 function CreativeGame.sv_exportCreation( self, params )
-	local success, existing = pcall( sm.json.open, "$SURVIVAL_DATA/LocalBlueprints/"..params.name..".blueprint" )
+	local target = EXPORT_DIR..params.name..".blueprint"
+
+	local success, existing = pcall( sm.json.open, target )
 	if success and existing then
-		sm.json.save( existing, "$SURVIVAL_DATA/LocalBlueprints/"..params.name.."_backup.blueprint" )
+		sm.json.save( existing, EXPORT_DIR..params.name.."_backup.blueprint" )
 		self.network:sendToClients( "client_showMessage", "A blueprint named '"..params.name.."' already existed and was backed up as '"..params.name.."_backup'" )
 	end
 	local obj = sm.json.parseJsonString( sm.creation.exportToString( params.body ) )
-	sm.json.save( obj, "$SURVIVAL_DATA/LocalBlueprints/"..params.name..".blueprint" )
+	sm.json.save( obj, target )
 	self.network:sendToClients( "client_showMessage", "Exported #00ff00"..params.name )
 end
 
 function CreativeGame.sv_importCreation( self, params )
-	local status = pcall( sm.creation.importFromFile, params.world, "$SURVIVAL_DATA/LocalBlueprints/"..params.name..".blueprint", params.position )
+	local path, displayName = resolveBlueprint( params.name )
+	if not path then
+		return self.network:sendToClients( "client_showMessage", "#ff0000No blueprint or export named '"..tostring( params.name ).."'" )
+	end
+	local status = pcall( sm.creation.importFromFile, params.world, path, params.position )
 	if status == false then
-		self.network:sendToClients( "client_showMessage", "#ff0000Import failed (missing blueprint, or it contains survival-only parts)" )
+		self.network:sendToClients( "client_showMessage", "#ff0000Could not import '"..tostring( displayName ).."' (it may contain parts this mode does not have)" )
 	end
 end
 

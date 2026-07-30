@@ -101,6 +101,91 @@ local function spendFromContainer( container, content )
 	return sm.container.endTransaction()
 end
 
+-- [SurvivalImportMod] blueprint lookup.
+--
+-- A creation saved the normal way - on a lift, "Save blueprint" - is stored as a UGC
+-- content folder under the user profile and the engine registers it under the path
+-- alias $CONTENT_<localId>, the same path the Scrap City garage's blueprint picker
+-- hands to GarageConsole.cl_e_trackBlueprint. So $CONTENT_<localId>/blueprint.json is
+-- readable from script; what is NOT available is any way to list a directory, so the
+-- name -> localId map has to come from somewhere else. refresh-blueprints.bat writes
+-- it into the file below. Re-run that script after saving new blueprints on a lift.
+local USER_BLUEPRINT_INDEX = "$SURVIVAL_DATA/LocalBlueprints/_userblueprints.json"
+
+-- /export writes here rather than straight into LocalBlueprints, which is where the
+-- game keeps its own ~900 level-decoration blueprints - mixing the two makes the
+-- player's own creations impossible to pick out of a listing.
+local EXPORT_DIR = "$SURVIVAL_DATA/LocalBlueprints/Exported/"
+
+-- "Car mk1", "car_mk1" and "CARMK1" all collapse to the same key. The chat parser
+-- splits on spaces and nobody wants to reproduce exact capitalisation from memory.
+local function blueprintKey( name )
+	return ( tostring( name ):lower():gsub( "[^%w]", "" ) )
+end
+
+local function fileExists( path )
+	local ok, exists = pcall( sm.json.fileExists, path )
+	if ok then return exists == true end
+	-- sm.json.fileExists is only ever called from client scripts in the vanilla code
+	-- (GarageConsole). If it turns out not to be callable here, opening the file is a
+	-- slower but equivalent answer - without this, every lookup would report "missing".
+	local opened, data = pcall( sm.json.open, path )
+	return opened and type( data ) == "table"
+end
+
+-- reads the index fresh every time: it is a tiny file and it changes behind the
+-- game's back whenever the refresh script runs
+local function loadBlueprintIndex()
+	local ok, index = pcall( sm.json.open, USER_BLUEPRINT_INDEX )
+	if not ok or type( index ) ~= "table" then
+		return { blueprints = {}, exports = {} }
+	end
+	index.blueprints = type( index.blueprints ) == "table" and index.blueprints or {}
+	index.exports = type( index.exports ) == "table" and index.exports or {}
+	return index
+end
+
+-- Resolves a name the way the player expects: their own saved blueprints first,
+-- /export files as the fallback. Returns path, displayName, source | nil.
+local function resolveBlueprint( name )
+	if name == nil or name == "" then return nil end
+	name = tostring( name )
+	local wanted = blueprintKey( name )
+	if wanted == "" then return nil end
+
+	for _, entry in ipairs( loadBlueprintIndex().blueprints ) do
+		if type( entry ) == "table" and entry.id and blueprintKey( entry.key or entry.name or "" ) == wanted then
+			local path = "$CONTENT_" .. tostring( entry.id ) .. "/blueprint.json"
+			if fileExists( path ) then
+				return path, tostring( entry.name or name ), "blueprint"
+			end
+		end
+	end
+
+	-- a raw local id works too, so a blueprint saved since the last refresh is still
+	-- reachable (the folder name under User/<user>/Blueprints is the id)
+	if string.find( name, "^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$" ) then
+		local path = "$CONTENT_" .. name .. "/blueprint.json"
+		if fileExists( path ) then
+			return path, name, "blueprint"
+		end
+	end
+
+	local exported = EXPORT_DIR .. name .. ".blueprint"
+	if fileExists( exported ) then
+		return exported, name, "export"
+	end
+
+	-- exports made before /export moved into Exported/, and the game's own asset
+	-- blueprints, which are occasionally handy to place
+	local legacy = "$SURVIVAL_DATA/LocalBlueprints/" .. name .. ".blueprint"
+	if fileExists( legacy ) then
+		return legacy, name, "export"
+	end
+
+	return nil
+end
+
 function SurvivalGame.server_onCreate( self )
 	self.sv = {}
 	self.sv.saved = self.storage:load()
@@ -288,11 +373,14 @@ function SurvivalGame.sim_bindCommands( self )
 		return nil
 	end
 
-	bind( { "/export", "/bpexport" }, { { "string", "name", false } }, "Exports aimed creation to $SURVIVAL_DATA/LocalBlueprints/<name>.blueprint" )
-	bind( { "/build", "/bpbuild" }, { { "string", "name", false } }, "Imports blueprint <name>, requires the materials in your inventory (missing parts are listed)" )
-	bind( { "/destroy", "/bpdestroy" }, {}, "Destroys aimed creation and drops its parts as loot (autosaved to LocalBlueprints/autosave.blueprint)" )
-	-- [SurvivalImportMod] TEMPORARY: /import available without dev mode to restore a lost creation. Revert after.
-	bind( { "/import", "/bpimport" }, { { "string", "name", false } }, "Imports blueprint <name> with NO material cost (TEMPORARY)" )
+	-- the extra optional words let a blueprint saved as "Car mk1" be typed as-is;
+	-- the chat parser has no quoting, so a name arrives split across arguments
+	local nameArgs = { { "string", "name", false }, { "string", "...", true }, { "string", "...", true }, { "string", "...", true } }
+
+	bind( { "/export", "/bpexport" }, { { "string", "name", false } }, "Exports aimed creation to $SURVIVAL_DATA/LocalBlueprints/Exported/<name>.blueprint" )
+	bind( { "/build", "/bpbuild" }, nameArgs, "Builds <name> - one of your saved blueprints, or an /export - from the materials in your inventory" )
+	bind( { "/blueprints", "/bplist" }, {}, "Lists the creations /build can place" )
+	bind( { "/destroy", "/bpdestroy" }, {}, "Destroys aimed creation and drops its parts as loot (autosaved, rebuild with /build autosave)" )
 
 	self.cl.simReport = table.concat( report, ", " )
 end
@@ -310,6 +398,9 @@ function SurvivalGame.bindChatCommands( self )
 	local addCheats = g_survivalDev
 
 	if addCheats then
+		-- [SurvivalImportMod] free spawning is a cheat, so it lives with the other cheats.
+		-- /build is the survival-legal way in: it charges the materials.
+		pcall( sm.game.bindChatCommand, "/import", { { "string", "name", false }, { "string", "...", true }, { "string", "...", true }, { "string", "...", true } }, "cl_onChatCommand", "Spawns <name> with NO material cost" )
 		sm.game.bindChatCommand( "/ammo", { { "int", "quantity", true } }, "cl_onChatCommand", "Give ammo (default 100)" )
 		sm.game.bindChatCommand( "/spudgun", {}, "cl_onChatCommand", "Give the spudgun" )
 		sm.game.bindChatCommand( "/gatling", {}, "cl_onChatCommand", "Give the potato gatling gun" )
@@ -713,12 +804,23 @@ function SurvivalGame.cl_onChatCommand( self, params )
 		else
 			sm.gui.chatMessage( "#ff0000Aim at a creation to export it" )
 		end
+	elseif params[1] == "/blueprints" or params[1] == "/bplist" then
+		self:cl_sim_listBlueprints()
 	elseif params[1] == "/import" or params[1] == "/bpimport" or params[1] == "/build" or params[1] == "/bpbuild" then
+		-- the name arrives split across arguments when it contains spaces
+		local nameParts = {}
+		for i = 2, #params do
+			if type( params[i] ) == "string" and params[i] ~= "" then
+				nameParts[#nameParts + 1] = params[i]
+			end
+		end
+		local name = table.concat( nameParts, " " )
+
 		local rayCastValid, rayCastResult = sm.localPlayer.getRaycast( 100 )
 		if rayCastValid then
 			local importParams = {
 				world = sm.localPlayer.getPlayer().character:getWorld(),
-				name = params[2],
+				name = name,
 				position = rayCastResult.pointWorld
 			}
 			if params[1] == "/build" or params[1] == "/bpbuild" then
@@ -1232,19 +1334,24 @@ end
 
 -- [SurvivalImportMod] export with automatic backup of an existing blueprint of the same name
 function SurvivalGame.sv_exportCreation( self, params )
-	local success, existing = pcall( sm.json.open, "$SURVIVAL_DATA/LocalBlueprints/"..params.name..".blueprint" )
+	local target = EXPORT_DIR..params.name..".blueprint"
+
+	local success, existing = pcall( sm.json.open, target )
 	if success and existing then
-		sm.json.save( existing, "$SURVIVAL_DATA/LocalBlueprints/"..params.name.."_backup.blueprint" )
+		sm.json.save( existing, EXPORT_DIR..params.name.."_backup.blueprint" )
 		self.network:sendToClients( "client_showMessage", "A blueprint named '"..params.name.."' already existed and was backed up. Restore it with #00ff00/build "..params.name.."_backup" )
 	end
 	local obj = sm.json.parseJsonString( sm.creation.exportToString( params.body ) )
-	sm.json.save( obj, "$SURVIVAL_DATA/LocalBlueprints/"..params.name..".blueprint" )
+	sm.json.save( obj, target )
 	self.network:sendToClients( "client_showMessage", "Exported #00ff00"..params.name )
 end
 
 -- [SurvivalImportMod] /build consumes materials from the player inventory, /import (dev cheat) does not
 function SurvivalGame.sv_importCreation( self, params, caller )
-	local path = "$SURVIVAL_DATA/LocalBlueprints/"..params.name..".blueprint"
+	local path, displayName = resolveBlueprint( params.name )
+	if not path then
+		return self.network:sendToClients( "client_showMessage", "#ff0000No blueprint or export named '"..tostring( params.name ).."'. #ffffffUse #00ff00/blueprints#ffffff to see what is available." )
+	end
 
 	if not params.consume then
 		sm.creation.importFromFile( params.world, path, params.position )
@@ -1258,14 +1365,14 @@ function SurvivalGame.sv_importCreation( self, params, caller )
 
 	local opened, data = pcall( sm.json.open, path )
 	if not opened or type( data ) ~= "table" or not data.bodies then
-		return self.network:sendToClients( "client_showMessage", "#ff0000Blueprint '"..tostring( params.name ).."' does not exist!" )
+		return self.network:sendToClients( "client_showMessage", "#ff0000Blueprint '"..tostring( displayName ).."' could not be read!" )
 	end
 
 	-- cost is computed from the table we just parsed, not from the path again, so a
 	-- blueprint written moments ago (/export, /destroy) is priced from its real contents
 	local content, costError = blueprintCost( data )
 	if not content then
-		return self.network:sendToClients( "client_showMessage", "#ff0000Could not read the cost of '"..tostring( params.name ).."': "..tostring( costError ) )
+		return self.network:sendToClients( "client_showMessage", "#ff0000Could not read the cost of '"..tostring( displayName ).."': "..tostring( costError ) )
 	end
 
 	-- a blueprint from an older game version can name parts that no longer exist
@@ -1286,26 +1393,12 @@ function SurvivalGame.sv_importCreation( self, params, caller )
 	local inventory = player:getInventory()
 	local missing = missingFromContainer( inventory, usable )
 
-	-- [SurvivalImportMod] diagnostic: chat/log output from the server script is unreliable
-	-- here, so dump what the cost check actually saw. Safe to delete.
-	pcall( function()
-		local dump = { blueprint = tostring( params.name ), parts = {}, unknownParts = #unknown, missingCount = #missing }
-		for _, shapeData in ipairs( usable ) do
-			dump.parts[#dump.parts + 1] = {
-				uuid = tostring( shapeData.uuid ),
-				needed = shapeData.quantity,
-				inInventory = sm.container.totalQuantity( inventory, shapeData.uuid )
-			}
-		end
-		sm.json.save( dump, "$SURVIVAL_DATA/LocalBlueprints/_build_debug.json" )
-	end )
-
 	if #missing > 0 then
 		local report = {}
 		for _, entry in ipairs( missing ) do
 			report[#report + 1] = { uuid = tostring( entry.uuid ), quantity = entry.quantity }
 		end
-		self.network:sendToClients( "client_sim_reportParts", { title = "#ff0000Not enough materials to build '"..tostring( params.name ).."'. Missing:", parts = report, alert = "Missing materials - see chat" } )
+		self.network:sendToClients( "client_sim_reportParts", { title = "#ff0000Not enough materials to build '"..tostring( displayName ).."'. Missing:", parts = report, alert = "Missing materials - see chat" } )
 		return
 	end
 
@@ -1314,7 +1407,7 @@ function SurvivalGame.sv_importCreation( self, params, caller )
 	end
 
 	sm.creation.importFromFile( params.world, path, params.position )
-	self.network:sendToClients( "client_showMessage", "Built #00ff00"..tostring( params.name ).."#ffffff from your materials." )
+	self.network:sendToClients( "client_showMessage", "Built #00ff00"..tostring( displayName ).."#ffffff from your materials." )
 end
 
 -- [SurvivalImportMod] destroy aimed creation and drop all of its parts as loot
@@ -1329,7 +1422,7 @@ function SurvivalGame.sv_destroyCreation( self, params )
 		return self.network:sendToClients( "client_showMessage", "#ff0000Could not read the creation's part list: "..tostring( costError ).." - nothing was destroyed." )
 	end
 
-	sm.json.save( data, "$SURVIVAL_DATA/LocalBlueprints/autosave.blueprint" )
+	sm.json.save( data, EXPORT_DIR.."autosave.blueprint" )
 
 	local loot = {}
 	for _, shapeData in ipairs( content ) do
@@ -1353,6 +1446,33 @@ end
 -- [SurvivalImportMod] part lists are formatted client-side: sm.shape.getShapeTitle reads
 -- the localisation tables, which are a client thing. Calling it on the server aborted the
 -- whole handler, which is why the "missing materials" list never reached the chat.
+-- [SurvivalImportMod] /blueprints - purely client side, it only reads the index file
+function SurvivalGame.cl_sim_listBlueprints( self )
+	local index = loadBlueprintIndex()
+
+	sm.gui.chatMessage( "#00ff00Blueprints#ffffff (saved on a lift):" )
+	if #index.blueprints == 0 then
+		sm.gui.chatMessage( "  #808080none indexed - run refresh-blueprints.bat and rejoin" )
+	else
+		for _, entry in ipairs( index.blueprints ) do
+			sm.gui.chatMessage( "  #ffff00" .. tostring( entry.name ) )
+		end
+	end
+
+	sm.gui.chatMessage( "#00ff00Exports#ffffff (/export):" )
+	if #index.exports == 0 then
+		sm.gui.chatMessage( "  #808080none" )
+	else
+		for _, name in ipairs( index.exports ) do
+			sm.gui.chatMessage( "  #ffff00" .. tostring( name ) )
+		end
+	end
+
+	if index.generated then
+		sm.gui.chatMessage( "#808080Index from " .. tostring( index.generated ) .. " - re-run refresh-blueprints.bat after saving new blueprints." )
+	end
+end
+
 function SurvivalGame.client_sim_reportParts( self, params )
 	if params.alert then
 		sm.gui.displayAlertText( params.alert )

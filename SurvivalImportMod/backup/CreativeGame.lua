@@ -2,9 +2,11 @@ dofile( "$GAME_DATA/Scripts/game/managers/EffectManager.lua" )
 dofile( "$SURVIVAL_DATA/Scripts/game/managers/UnitManager.lua" )
 dofile( "$GAME_DATA/Scripts/game/managers/KinematicManager.lua" )
 dofile( "$GAME_DATA/Scripts/game/managers/TileStorageManager.lua" )
+dofile( "$GAME_DATA/Scripts/game/managers/WeatherManager.lua" )
 dofile( "$SURVIVAL_DATA/Scripts/game/util/recipes.lua" )
 dofile( "$SURVIVAL_DATA/Scripts/game/survival_projectiles.lua" )
 dofile( "$SURVIVAL_DATA/Scripts/game/survival_meleeattacks.lua" )
+dofile( "$SURVIVAL_DATA/Scripts/game/survival_constants.lua" )
 dofile( "$SURVIVAL_DATA/Scripts/game/managers/WorldManager.lua" )
 dofile( "$SURVIVAL_DATA/Scripts/game/scriptableObjects/GlowstickManager.lua" )
 
@@ -18,6 +20,15 @@ CreativeGame.enableFuelConsumption = false
 CreativeGame.enableAmmoConsumption = false
 CreativeGame.enableUpgrade = true
 CreativeGame.enableRecipes = false
+
+local TimeSyncInterval = 400
+local WeatherConditions = {
+	rain = "Rain",
+	thunder = "ThunderRain",
+	clear = "Clear",
+	cloudy = "Clouds01",
+	drizzle = "Drizzle",
+}
 
 function CreativeGame.server_onCreate( self )
 	self.sv = {}
@@ -33,7 +44,7 @@ function CreativeGame.server_onCreate( self )
 
 	WorldManager.Sv_OnCreate()
 
-	self.sv.weatherManager = sm.scriptableObject.createScriptableObject( sm.uuid.new( "46e23051-c20b-4929-9df1-7f4f838a3802" ), { permanentForecast = "default" } )
+	self.sv.weatherManager = sm.scriptableObject.createScriptableObject( sm.uuid.new( "46e23051-c20b-4929-9df1-7f4f838a3802" ), { permanentForecast = "CloudyDay", resetForecast = true } )
 
 	self.sv.saved = self.storage:load()
 	if self.sv.saved == nil then
@@ -55,17 +66,18 @@ function CreativeGame.server_onCreate( self )
 		sm.world.loadWorld( self.sv.saved.world )
 	end
 
-	local time = sm.storage.load( STORAGE_CHANNEL_TIME )
-	if time then
+	self.sv.time = sm.storage.load( STORAGE_CHANNEL_TIME )
+	if self.sv.time then
 		print( "Loaded timeData:" )
-		print( time )
+		print( self.sv.time )
 	else
-		time = {}
-		time.timeOfDay = 0.5
-		sm.storage.save( STORAGE_CHANNEL_TIME, time )
+		self.sv.time = { timeOfDay = 0.5, timeProgress = false }
 	end
+	self.sv.time.timeProgress = self.sv.time.timeProgress or false
+	self.sv.timeSyncTick = 0
+	sm.storage.save( STORAGE_CHANNEL_TIME, self.sv.time )
 
-	self.network:setClientData( { time = time.timeOfDay } )
+	self.network:setClientData( { time = self.sv.time } )
 
 	self:loadCraftingRecipes()
 	g_godMode = true
@@ -80,10 +92,24 @@ function CreativeGame.loadCraftingRecipes( self )
 end
 
 function CreativeGame.server_onFixedUpdate( self, timeStep )
+	if self.sv.time.timeProgress then
+		self.sv.time.timeOfDay = self.sv.time.timeOfDay + ( timeStep / DAYCYCLE_TIME )
+	end
+
+	WeatherManager.Sv_SetTimeOfDay( self.sv.time.timeOfDay )
+
+	self.sv.timeSyncTick = self.sv.timeSyncTick + 1
+	if self.sv.timeSyncTick >= TimeSyncInterval then
+		self.sv.timeSyncTick = 0
+		sm.storage.save( STORAGE_CHANNEL_TIME, self.sv.time )
+		self.network:setClientData( { time = self.sv.time } )
+	end
+
 	g_unitManager:sv_onFixedUpdate()
 end
 
 function CreativeGame.server_onPlayerJoined( self, player, newPlayer )
+	WeatherManager.Sv_PlayerJoined( player )
 	if newPlayer then
 		self.sv.saved.world:loadCell( 0, 0, player, "sv_createNewPlayer" )
 	end
@@ -99,9 +125,10 @@ function CreativeGame.client_onCreate( self )
 		self:loadCraftingRecipes()
 	end
 
-	self.cl = {}
+	self.cl = { time = { timeOfDay = 0.5, timeProgress = false } }
 
 	WorldManager.Cl_OnCreate()
+	self.cl.renderManager = sm.clientScriptableObject.createScriptableObject( sm.uuid.new( "54563daa-dd25-4f43-9e49-7e58bd59f66a" ) )
 	
 	g_radioTransmitter = sm.effect.createEffect( "Radio - Transmitter" )
 	g_radioTransmitter:setWorldAny()
@@ -116,6 +143,9 @@ function CreativeGame.client_onCreate( self )
 	sm.game.bindChatCommand( "/dropscrap", {}, "cl_onChatCommand", "Toggles the scrap loot from Haybots" )
 	sm.game.bindChatCommand( "/place", { { "string", "harvestable", false } }, "cl_onChatCommand", "Places a harvestable at the aimed position. Must be placed on the ground. The harvestable parameter controls which harvestable to place: 'stone', 'tree', 'birch', 'leafy', 'spruce', 'pine'" )
 	sm.game.bindChatCommand( "/restrictions", { { "bool", "enable", true } }, "cl_onChatCommand", "Toggles restrictions on creations" )
+	sm.game.bindChatCommand( "/timeofday", { { "number", "timeOfDay", true } }, "cl_onChatCommand", "Sets the time of the day as a fraction (0.5=mid day)" )
+	sm.game.bindChatCommand( "/timeprogress", { { "bool", "enabled", true } }, "cl_onChatCommand", "Enables or disables time progress" )
+	sm.game.bindChatCommand( "/weather", { { "string", "condition", false, { "rain", "thunder", "clear", "cloudy", "drizzle" } } }, "cl_onChatCommand", "Sets the weather condition" )
 	sm.game.bindChatCommand( "/day", {}, "cl_onChatCommand", "Sets time of day to day" )
 	sm.game.bindChatCommand( "/night", {}, "cl_onChatCommand", "Sets time of day to night" )
 
@@ -170,10 +200,35 @@ function CreativeGame.cl_compassHudEnable( self, enable )
 end
 
 function CreativeGame.client_onClientDataUpdate( self, clientData )
-	sm.game.setTimeOfDay( clientData.time )
-	sm.render.setOutdoorLighting( clientData.time )
+	self.cl.time = clientData.time
+	self:cl_updateTimeOfDay()
+end
+
+function CreativeGame.client_onUpdate( self, dt )
+	if self.cl.time.timeProgress then
+		self.cl.time.timeOfDay = self.cl.time.timeOfDay + ( dt / DAYCYCLE_TIME )
+	end
+	self:cl_updateTimeOfDay()
+end
+
+function CreativeGame.cl_updateTimeOfDay( self )
+	local timeOfDay = math.fmod( self.cl.time.timeOfDay, 1 )
+	sm.game.setTimeOfDay( timeOfDay )
+
+	local index = 1
+	while index < #DAYCYCLE_LIGHTING_TIMES and timeOfDay >= DAYCYCLE_LIGHTING_TIMES[index + 1] do
+		index = index + 1
+	end
+
+	local light = DAYCYCLE_LIGHTING_VALUES[index]
+	if index < #DAYCYCLE_LIGHTING_TIMES then
+		local fraction = ( timeOfDay - DAYCYCLE_LIGHTING_TIMES[index] ) / ( DAYCYCLE_LIGHTING_TIMES[index + 1] - DAYCYCLE_LIGHTING_TIMES[index] )
+		light = sm.util.lerp( DAYCYCLE_LIGHTING_VALUES[index], DAYCYCLE_LIGHTING_VALUES[index + 1], fraction )
+	end
+	sm.render.setOutdoorLighting( light )
+
 	if WeatherManager.Get() then
-		WeatherManager.Get():cl_setTimeOfDay( clientData.time )
+		WeatherManager.Get():cl_setTimeOfDay( self.cl.time.timeOfDay )
 	end
 end
 
@@ -303,20 +358,44 @@ function CreativeGame.sv_n_onChatCommand( self, params, player )
 		end
 		sm.game.setEnableRestrictions( restrictions )
 		self.network:sendToClients( "client_showMessage", "RESTRICTIONS: " .. ( restrictions and "On" or "Off" ) )
+	elseif params[1] == "/timeofday" then
+		self:sv_setTimeOfDay( params[2] )
+	elseif params[1] == "/timeprogress" then
+		self:sv_setTimeProgress( params[2] )
+	elseif params[1] == "/weather" then
+		local condition = WeatherConditions[string.lower( params[2] )]
+		if condition then
+			WeatherManager.Sv_StartCondition( condition )
+			self.network:sendToClients( "client_showMessage", "Weather: " .. params[2] )
+		end
 	elseif params[1] == "/day" then
-		local time = { timeOfDay = 0.5 }
-		sm.storage.save( STORAGE_CHANNEL_TIME, time )
-		self.network:setClientData( { time = 0.5 } )
+		self:sv_setTimeOfDay( 0.5 )
 	elseif params[1] == "/night" then
-		local time = { timeOfDay = 0.0 }
-		sm.storage.save( STORAGE_CHANNEL_TIME, time )
-		self.network:setClientData( { time = 0.0 } )
+		self:sv_setTimeOfDay( 0.0 )
 	else
 		if sm.exists( player.character ) then
 			params.player = player
 			sm.event.sendToWorld( player.character:getWorld(), "sv_e_onChatCommand", params )
 		end
 	end
+end
+
+function CreativeGame.sv_setTimeOfDay( self, timeOfDay )
+	if timeOfDay ~= nil then
+		self.sv.time.timeOfDay = math.floor( self.sv.time.timeOfDay ) + sm.util.clamp( timeOfDay, 0.0, 0.9999 )
+		sm.storage.save( STORAGE_CHANNEL_TIME, self.sv.time )
+		self.network:setClientData( { time = self.sv.time } )
+	end
+	self.network:sendToClients( "client_showMessage", "Time of day set to " .. self.sv.time.timeOfDay )
+end
+
+function CreativeGame.sv_setTimeProgress( self, timeProgress )
+	if timeProgress ~= nil then
+		self.sv.time.timeProgress = timeProgress
+		sm.storage.save( STORAGE_CHANNEL_TIME, self.sv.time )
+		self.network:setClientData( { time = self.sv.time } )
+	end
+	self.network:sendToClients( "client_showMessage", "Time progress: " .. ( self.sv.time.timeProgress and "On" or "Off" ) )
 end
 
 -- Beacons

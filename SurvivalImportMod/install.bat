@@ -5,14 +5,30 @@ rem  Survival Import Mod - installer (ported to Scrap Mechanic 1.0)
 rem  Backs up the vanilla files, then copies the patched ones in.
 rem ============================================================
 
+rem --- locate the game folder by walking up from this script ---
+rem     Release\ScrapMechanic.exe is the marker, not Survival\Scripts: this mod
+rem     keeps its own copy of the script tree, which would match too.
+set "GAME=%~dp0."
+if exist "%GAME%\Release\ScrapMechanic.exe" goto :gotgame
 set "GAME=%~dp0.."
+if exist "%GAME%\Release\ScrapMechanic.exe" goto :gotgame
+set "GAME=%~dp0..\.."
+if exist "%GAME%\Release\ScrapMechanic.exe" goto :gotgame
+set "GAME=%~dp0..\..\.."
+if exist "%GAME%\Release\ScrapMechanic.exe" goto :gotgame
+echo [!] Could not find the Scrap Mechanic folder above this script.
+echo     Keep this mod inside the game directory.
+goto :fail
+:gotgame
+
 set "SG=%GAME%\Survival\Scripts\game\SurvivalGame.lua"
 set "CG=%GAME%\Data\Scripts\game\CreativeGame.lua"
 set "PATCHED=%~dp0patched"
 set "BACKUP=%~dp0backup"
+set "EXPORTS=%GAME%\Survival\LocalBlueprints\Exported"
 
 if not exist "%SG%" (
-    echo [!] Could not find SurvivalGame.lua - is this folder inside the Scrap Mechanic directory?
+    echo [!] Could not find "%SG%".
     goto :fail
 )
 if not exist "%PATCHED%\SurvivalGame.lua" (
@@ -44,6 +60,9 @@ rem --- install ---
 copy /y "%PATCHED%\SurvivalGame.lua" "%SG%" >nul || goto :fail
 copy /y "%PATCHED%\CreativeGame.lua" "%CG%" >nul || goto :fail
 
+rem --- /export writes here; keeps player creations out of the ~900 game blueprints ---
+if not exist "%EXPORTS%" mkdir "%EXPORTS%"
+
 rem --- CRITICAL: the game executes a compiled bundle, not the .lua files. Editing a
 rem     script does nothing until this bundle is deleted; the game then rebuilds it
 rem     from the .lua files on the next launch (that launch takes a bit longer).
@@ -57,10 +76,17 @@ if exist "%GAME%\Cache\Bundle\core_data.cbo" (
     echo [i] Cleared the compiled script bundle - it rebuilds on next launch.
 )
 
+rem --- index the blueprints saved on a lift, so /build can find them by name ---
+echo.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0refresh-blueprints.ps1" -GameRoot "%GAME%"
+
 echo.
 echo [OK] Survival Import Mod installed!
-echo      In survival you now have: /export ^<name^>, /build ^<name^>, /destroy
-echo      In creative you now have: /export ^<name^>, /import ^<name^>
+echo      In survival:  /build ^<name^>, /blueprints, /export ^<name^>, /destroy
+echo      In creative:  /export ^<name^>, /import ^<name^>
+echo.
+echo      After saving new creations on a lift, run refresh-blueprints.bat
+echo      so /build can find them by name.
 echo.
 echo      NOTE: a game update or "Verify integrity of game files" in Steam
 echo      will restore the vanilla files - just run install.bat again.

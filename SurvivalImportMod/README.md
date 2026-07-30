@@ -49,17 +49,50 @@ Survival mode (no dev mode needed):
 
 | Command | Effect |
 |---|---|
-| `/export <name>` | Saves the creation you aim at to `Survival\LocalBlueprints\<name>.blueprint`. An existing blueprint of that name is backed up as `<name>_backup` first. |
-| `/build <name>` | Imports the blueprint at the spot you aim at, **consuming the required parts from your inventory** (container contents included). If anything is missing, nothing is built and the missing parts are listed in chat. |
-| `/destroy` | Destroys the creation you aim at and drops all of its parts as loot bags. The creation is autosaved to `autosave.blueprint` first (`/build autosave` restores it). |
+| `/build <name>` | Builds `<name>` where you are aiming, **consuming the required parts from your inventory** (container contents included). If anything is missing, nothing is built and the missing parts are listed in chat. |
+| `/blueprints` | Lists everything `/build` can place. |
+| `/export <name>` | Saves the creation you aim at to `Survival\LocalBlueprints\Exported\<name>.blueprint`. An existing export of that name is backed up as `<name>_backup` first. |
+| `/destroy` | Destroys the creation you aim at and drops all of its parts as loot bags. The creation is autosaved first, so `/build autosave` puts it back. |
 
 `/import <name>` (free, no materials) is bound **only in dev mode**, so normal survival
 play has no way to spawn a creation for free.
 
-Creative mode: `/export <name>` and `/import <name>` (shares the same
-`LocalBlueprints` folder, so you can design in creative and build in survival).
+Creative mode: `/export <name>` and `/import <name>`, sharing the same blueprints, so
+you can design in creative and build it for real in survival.
 
-Blueprints live in: `Steam\steamapps\common\Scrap Mechanic\Survival\LocalBlueprints\`
+## What `/build <name>` can find
+
+Two kinds of creation, checked in this order:
+
+1. **Blueprints you saved in-game** — park a creation on a lift, interact with it and
+   save. `/build Car mk1` builds the one named *Car mk1*.
+2. **`/export` files** — `Survival\LocalBlueprints\Exported\<name>.blueprint`.
+
+If both exist with the same name, the in-game blueprint wins. Names ignore case,
+spaces and underscores, so `Car mk1`, `car_mk1` and `CARMK1` are the same thing. A
+blueprint's local id (the guid folder name) works as a name too.
+
+### Run `refresh-blueprints.bat` after saving new blueprints
+
+A creation saved on a lift is stored in your user profile in a folder named after its
+local id, and the game exposes it to scripts as `$CONTENT_<localId>`. Scripts can read
+that path, but Lua in Scrap Mechanic **has no way to list a directory** — so nothing in
+the game can turn the name you typed into a folder id on its own.
+
+`refresh-blueprints.bat` scans your profile and writes that name → id map to
+`Survival\LocalBlueprints\_userblueprints.json`. `install.bat` runs it for you, but
+after you save a *new* blueprint on a lift you have to run it again before `/build`
+knows the name. It is safe to run while the game is open; rejoin the world (or use the
+guid) to pick up the change. `/blueprints` prints when the index was last built.
+
+Files:
+
+* saved in-game → `%APPDATA%\Axolot Games\Scrap Mechanic\User\User_<id>\Blueprints\`
+* `/export`     → `Steam\steamapps\common\Scrap Mechanic\Survival\LocalBlueprints\Exported\`
+
+`Exported\` is a subfolder on purpose: `LocalBlueprints` itself holds ~900 of the
+game's own level-decoration blueprints, which would bury your creations in any listing.
+They are all still reachable by name if you want to place one.
 
 ## Multiplayer note
 
