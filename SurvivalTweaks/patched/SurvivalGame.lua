@@ -1,5 +1,6 @@
--- [SurvivalImportMod] Vanilla 1.0 SurvivalGame.lua patched with the Survival Import Mod
--- (adds /export, /build, /destroy - blueprint building that consumes inventory materials)
+-- [SurvivalTweaks] Vanilla 1.0 SurvivalGame.lua patched with Survival Tweaks
+-- (adds /build, /blueprints, /export, /destroy - blueprint building that consumes
+--  inventory materials - and /falldamage)
 -- IMPORTANT: the game runs a compiled bundle (Cache\Bundle\core_data.cbo), not these
 -- .lua files. Editing a script has NO effect until that bundle is deleted so the game
 -- rebuilds it. install.bat/uninstall.bat handle this automatically.
@@ -64,7 +65,7 @@ SurvivalGame.enableUpgrade = true
 
 local SyncInterval = 400 -- 400 ticks | 10 seconds
 
--- [SurvivalImportMod] helpers for counting/consuming blueprint materials.
+-- [SurvivalTweaks] helpers for counting/consuming blueprint materials.
 -- The material cost comes from sm.creation.getBlueprintCost - the engine's own
 -- function, the same one the Scrap City garage uses. It understands 1.0 blueprints
 -- (block bounds, joints, container contents, parts that map to a different item id)
@@ -101,7 +102,7 @@ local function spendFromContainer( container, content )
 	return sm.container.endTransaction()
 end
 
--- [SurvivalImportMod] blueprint lookup.
+-- [SurvivalTweaks] blueprint lookup.
 --
 -- A creation saved the normal way - on a lift, "Save blueprint" - is stored as a UGC
 -- content folder under the user profile and the engine registers it under the path
@@ -202,6 +203,15 @@ function SurvivalGame.server_onCreate( self )
 	end
 	self.sv.saved.lootTier = self.sv.saved.lootTier or 1
 	g_lootTier = self.sv.saved.lootTier
+
+	-- [SurvivalTweaks] fall damage switch, stored per world so it survives rejoining.
+	-- Read by BasePlayer.server_onCollision. `or` cannot express a boolean default here -
+	-- `saved.x or true` is true even when the player turned it off - hence the nil test.
+	if self.sv.saved.disableFallDamage == nil then
+		self.sv.saved.disableFallDamage = true
+	end
+	g_disableFallDamage = self.sv.saved.disableFallDamage
+
 	self.storage:save( self.sv.saved )
 
 	self.data = nil
@@ -343,7 +353,7 @@ function SurvivalGame.client_onCreate( self )
 
 	self.cl.renderManager = sm.clientScriptableObject.createScriptableObject( sm.uuid.new( "54563daa-dd25-4f43-9e49-7e58bd59f66a" ) )
 
-	-- [SurvivalImportMod] bind here, like CreativeGame does. bindChatCommands() only
+	-- [SurvivalTweaks] bind here, like CreativeGame does. bindChatCommands() only
 	-- runs from a client-data callback, which is not a guaranteed path.
 	self:sim_bindCommands()
 
@@ -352,7 +362,7 @@ function SurvivalGame.client_onCreate( self )
 
 end
 
--- [SurvivalImportMod] binds the mod's chat commands exactly once, and records the
+-- [SurvivalTweaks] binds the mod's chat commands exactly once, and records the
 -- outcome so it can be reported in chat once the loading screen is gone.
 function SurvivalGame.sim_bindCommands( self )
 	self.cl = self.cl or {}
@@ -381,6 +391,8 @@ function SurvivalGame.sim_bindCommands( self )
 	bind( { "/build", "/bpbuild" }, nameArgs, "Builds <name> - one of your saved blueprints, or an /export - from the materials in your inventory" )
 	bind( { "/blueprints", "/bplist" }, {}, "Lists the creations /build can place" )
 	bind( { "/destroy", "/bpdestroy" }, {}, "Destroys aimed creation and drops its parts as loot (autosaved, rebuild with /build autosave)" )
+	-- optional bool: bare /falldamage toggles, /falldamage on|off sets it explicitly
+	bind( { "/falldamage" }, { { "bool", "enabled", true } }, "Turns fall damage on or off for this world (off by default)" )
 
 	self.cl.simReport = table.concat( report, ", " )
 end
@@ -398,7 +410,7 @@ function SurvivalGame.bindChatCommands( self )
 	local addCheats = g_survivalDev
 
 	if addCheats then
-		-- [SurvivalImportMod] free spawning is a cheat, so it lives with the other cheats.
+		-- [SurvivalTweaks] free spawning is a cheat, so it lives with the other cheats.
 		-- /build is the survival-legal way in: it charges the materials.
 		pcall( sm.game.bindChatCommand, "/import", { { "string", "name", false }, { "string", "...", true }, { "string", "...", true }, { "string", "...", true } }, "cl_onChatCommand", "Spawns <name> with NO material cost" )
 		sm.game.bindChatCommand( "/ammo", { { "int", "quantity", true } }, "cl_onChatCommand", "Give ammo (default 100)" )
@@ -793,7 +805,7 @@ function SurvivalGame.cl_onChatCommand( self, params )
 		else
 			self.network:sendToServer( "sv_n_switchAggroMode", { aggroMode = not sm.game.getEnableAggro() } )
 		end
-	-- [SurvivalImportMod] blueprint export/build/destroy
+	-- [SurvivalTweaks] blueprint export/build/destroy
 	elseif params[1] == "/export" or params[1] == "/bpexport" then
 		local rayCastValid, rayCastResult = sm.localPlayer.getRaycast( 100 )
 		if rayCastValid and rayCastResult.type == "body" then
@@ -806,6 +818,9 @@ function SurvivalGame.cl_onChatCommand( self, params )
 		end
 	elseif params[1] == "/blueprints" or params[1] == "/bplist" then
 		self:cl_sim_listBlueprints()
+	elseif params[1] == "/falldamage" then
+		-- params[2] is nil when the argument is omitted, which means "toggle"
+		self.network:sendToServer( "sv_sim_switchFallDamage", { enabled = params[2] } )
 	elseif params[1] == "/import" or params[1] == "/bpimport" or params[1] == "/build" or params[1] == "/bpbuild" then
 		-- the name arrives split across arguments when it contains spaces
 		local nameParts = {}
@@ -1188,8 +1203,8 @@ function SurvivalGame.cl_n_onJoined( self, params )
 end
 
 function SurvivalGame.client_onLoadingScreenLifted( self )
-	-- [SurvivalImportMod] visible proof the patched script is live, plus bind results
-	sm.gui.chatMessage( "#00ff00[SurvivalImportMod]#ffffff ready: " .. tostring( self.cl and self.cl.simReport or "#ff0000no commands bound" ) )
+	-- [SurvivalTweaks] visible proof the patched script is live, plus bind results
+	sm.gui.chatMessage( "#00ff00[SurvivalTweaks]#ffffff ready: " .. tostring( self.cl and self.cl.simReport or "#ff0000no commands bound" ) )
 
 	EffectManager.Cl_OnLoadingScreenLifted()
 	TutorialManager.Cl_OnLoadingScreenLifted()
@@ -1217,6 +1232,24 @@ end
 function SurvivalGame.sv_switchGodMode( self )
 	g_godMode = not g_godMode
 	self.network:sendToClients( "client_showMessage", "GODMODE: " .. ( g_godMode and "On" or "Off" ) )
+end
+
+-- [SurvivalTweaks] /falldamage - modelled on sv_switchGodMode above, but the setting is
+-- written to the world save so it survives rejoining. Only the server needs the global:
+-- BasePlayer.server_onCollision, the one place that reads it, is server side.
+function SurvivalGame.sv_sim_switchFallDamage( self, params )
+	local enabled
+	if type( params ) == "table" and type( params.enabled ) == "boolean" then
+		enabled = params.enabled
+	else
+		enabled = g_disableFallDamage == true -- no argument: flip it
+	end
+
+	g_disableFallDamage = not enabled
+	self.sv.saved.disableFallDamage = g_disableFallDamage
+	self.storage:save( self.sv.saved )
+
+	self.network:sendToClients( "client_showMessage", "FALL DAMAGE: " .. ( enabled and "#ff0000On" or "#00ff00Off" ) )
 end
 
 function SurvivalGame.sv_n_switchAggroMode( self, params )
@@ -1332,7 +1365,7 @@ function SurvivalGame.sv_spawnHarvestable( self, params )
 	sm.event.sendToWorld( params.world, "sv_spawnHarvestable", params )
 end
 
--- [SurvivalImportMod] export with automatic backup of an existing blueprint of the same name
+-- [SurvivalTweaks] export with automatic backup of an existing blueprint of the same name
 function SurvivalGame.sv_exportCreation( self, params )
 	local target = EXPORT_DIR..params.name..".blueprint"
 
@@ -1346,7 +1379,7 @@ function SurvivalGame.sv_exportCreation( self, params )
 	self.network:sendToClients( "client_showMessage", "Exported #00ff00"..params.name )
 end
 
--- [SurvivalImportMod] /build consumes materials from the player inventory, /import (dev cheat) does not
+-- [SurvivalTweaks] /build consumes materials from the player inventory, /import (dev cheat) does not
 function SurvivalGame.sv_importCreation( self, params, caller )
 	local path, displayName = resolveBlueprint( params.name )
 	if not path then
@@ -1410,7 +1443,7 @@ function SurvivalGame.sv_importCreation( self, params, caller )
 	self.network:sendToClients( "client_showMessage", "Built #00ff00"..tostring( displayName ).."#ffffff from your materials." )
 end
 
--- [SurvivalImportMod] destroy aimed creation and drop all of its parts as loot
+-- [SurvivalTweaks] destroy aimed creation and drop all of its parts as loot
 function SurvivalGame.sv_destroyCreation( self, params )
 	local data = sm.json.parseJsonString( sm.creation.exportToString( params.body ) )
 
@@ -1443,10 +1476,10 @@ function SurvivalGame.client_showAlert( self, msg )
 	sm.gui.displayAlertText( msg )
 end
 
--- [SurvivalImportMod] part lists are formatted client-side: sm.shape.getShapeTitle reads
+-- [SurvivalTweaks] part lists are formatted client-side: sm.shape.getShapeTitle reads
 -- the localisation tables, which are a client thing. Calling it on the server aborted the
 -- whole handler, which is why the "missing materials" list never reached the chat.
--- [SurvivalImportMod] /blueprints - purely client side, it only reads the index file
+-- [SurvivalTweaks] /blueprints - purely client side, it only reads the index file
 function SurvivalGame.cl_sim_listBlueprints( self )
 	local index = loadBlueprintIndex()
 

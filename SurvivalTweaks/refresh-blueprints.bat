@@ -1,6 +1,6 @@
 @echo off
 rem ============================================================
-rem  Survival Import Mod - rebuild the blueprint index
+rem  Survival Tweaks - rebuild the blueprint index
 rem  Run this after saving new creations on a lift, so /build can find them.
 rem  Safe to run while the game is open.
 rem ============================================================

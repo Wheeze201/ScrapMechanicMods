@@ -1,4 +1,4 @@
--- [SurvivalImportMod] Vanilla 1.0 CreativeGame.lua patched with the Survival Import Mod
+-- [SurvivalTweaks] Vanilla 1.0 CreativeGame.lua patched with Survival Tweaks
 -- (adds /export and /import so blueprints can be shared with survival)
 dofile( "$GAME_DATA/Scripts/game/managers/EffectManager.lua" )
 dofile( "$SURVIVAL_DATA/Scripts/game/managers/UnitManager.lua" )
@@ -15,7 +15,7 @@ dofile( "$SURVIVAL_DATA/Scripts/game/scriptableObjects/GlowstickManager.lua" )
 
 
 
--- [SurvivalImportMod] blueprint lookup - same rules as survival's SurvivalGame.lua:
+-- [SurvivalTweaks] blueprint lookup - same rules as survival's SurvivalGame.lua:
 -- a creation saved on a lift wins, an /export file is the fallback. See the longer
 -- explanation there; in short, $CONTENT_<localId> is the alias the engine gives every
 -- saved blueprint, and _userblueprints.json maps names to those ids because script
@@ -201,17 +201,17 @@ function CreativeGame.client_onCreate( self )
 	sm.game.bindChatCommand( "/day", {}, "cl_onChatCommand", "Sets time of day to day" )
 	sm.game.bindChatCommand( "/night", {}, "cl_onChatCommand", "Sets time of day to night" )
 
-	-- [SurvivalImportMod] blueprint exchange with survival
+	-- [SurvivalTweaks] blueprint exchange with survival
 	-- pcall-protected: a name collision is logged and falls back to /bp* instead of
 	-- aborting all remaining bindings.
 	local function bindModCommand( names, args, help )
 		for _, name in ipairs( names ) do
 			local ok, err = pcall( sm.game.bindChatCommand, name, args, "cl_onChatCommand", help )
 			if ok then
-				sm.log.info( "[SurvivalImportMod] bound " .. name )
+				sm.log.info( "[SurvivalTweaks] bound " .. name )
 				return name
 			end
-			sm.log.warning( "[SurvivalImportMod] could not bind " .. name .. ": " .. tostring( err ) )
+			sm.log.warning( "[SurvivalTweaks] could not bind " .. name .. ": " .. tostring( err ) )
 		end
 		return nil
 	end
@@ -359,7 +359,7 @@ function CreativeGame.cl_onChatCommand( self, params )
 		else
 			sm.gui.chatMessage( "/clear is disabled. It must first be enabled with /allowclear" )
 		end
-	-- [SurvivalImportMod] blueprint export/import
+	-- [SurvivalTweaks] blueprint export/import
 	elseif params[1] == "/export" or params[1] == "/bpexport" then
 		local rayCastValid, rayCastResult = sm.localPlayer.getRaycast( 100 )
 		if rayCastValid and rayCastResult.type == "body" then
@@ -498,7 +498,7 @@ function CreativeGame.sv_setTimeProgress( self, timeProgress )
 	self.network:sendToClients( "client_showMessage", "Time progress: " .. ( self.sv.time.timeProgress and "On" or "Off" ) )
 end
 
--- [SurvivalImportMod] blueprint export/import server side
+-- [SurvivalTweaks] blueprint export/import server side
 function CreativeGame.sv_exportCreation( self, params )
 	local target = EXPORT_DIR..params.name..".blueprint"
 

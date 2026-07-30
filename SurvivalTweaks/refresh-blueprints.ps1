@@ -1,5 +1,5 @@
 # ============================================================
-#  Survival Import Mod - blueprint index generator
+#  Survival Tweaks - blueprint index generator
 #
 #  Creations saved in-game on a lift live in the user profile, one folder per
 #  blueprint named after its local id, and the engine exposes each one to script

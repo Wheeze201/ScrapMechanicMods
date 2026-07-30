@@ -1,0 +1,7 @@
+# sha256 of the vanilla file each patched file was built from.
+# install.bat refuses to install when the live vanilla no longer matches,
+# which is what stops a game update from being silently reverted.
+88D41565C6BDB268E8BE117F1F55E4B0165EBA10A57F12AAC6E1536DA3521BD3  BasePlayer.lua
+D74FFD3CF8AE6D4E84DC59CA7E3F18FF06D5627F24DACDA5B9CB11F291CD7A67  CreativeGame.lua
+829C6A0D2AE9C13415CCC15E4FFB021A2A3552C66050E030BDAE86EFCE3D5BF7  SurvivalGame.lua
+0F768A843C92003AB6AE722C8475F1C4ED586E48634DE44F309648356F0C0B99  util.lua
